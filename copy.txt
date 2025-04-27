@@ -1,0 +1,266 @@
+# app.py - Main application file for PDF-RAG
+
+import os
+import tempfile
+from typing import List
+
+import chainlit as cl
+from chainlit.types import AskFileResponse
+
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores import Chroma
+from langchain_groq import ChatGroq
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema.runnable import RunnablePassthrough
+from langchain.schema import StrOutputParser
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_groq.embeddings import GroqEmbeddings
+
+# Initialize environment variables - these would be set in .env or environment
+os.environ["GROQ_API_KEY"] = "your-groq-api-key"  # Replace with your actual API key or use .env
+
+# Initialize models
+EMBEDDING_MODEL = GroqEmbeddings(model="llama3-70b-8192")
+MODEL_NAME = "llama3-70b-8192"  # You can change to a different Groq model if needed
+
+# Initialize LLM
+llm = ChatGroq(
+    temperature=0.1,
+    model_name=MODEL_NAME,
+    api_key=os.environ["GROQ_API_KEY"],
+)
+
+# Create a global variable for the vector database
+vector_store = None
+
+# System prompt for the RAG application
+RAG_SYSTEM_PROMPT = """You are a helpful AI assistant that answers questions based on the provided PDF documents.
+Follow these guidelines:
+1. Answer questions based on the context provided from the PDF
+2. If the answer isn't in the context, say "I don't have enough information to answer this question based on the provided PDF"
+3. Keep answers concise but informative
+4. If the context contains relevant charts, tables, or figures, mention their existence in your answer
+5. Format your responses with markdown for readability where appropriate
+
+Context information from the PDF:
+{context}
+
+Question: {question}
+
+Answer the question based only on the provided context:"""
+
+
+# Function to process a PDF document
+def process_pdf(file: AskFileResponse) -> List[str]:
+    """Process a PDF file and split it into chunks for embedding."""
+    
+    # Save the file to a temporary location
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+        temp_file.write(file.content)
+        temp_file_path = temp_file.name
+    
+    # Use PyPDFLoader from Langchain to load the PDF
+    loader = PyPDFLoader(temp_file_path)
+    documents = loader.load()
+    
+    # Clean up the temporary file
+    os.unlink(temp_file_path)
+    
+    # Split the document into chunks
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+        separators=["\n\n", "\n", " ", ""],
+    )
+    
+    chunks = text_splitter.split_documents(documents)
+    
+    return chunks
+
+
+# Function to setup the RAG pipeline
+def setup_rag_pipeline():
+    """Setup the RAG pipeline with the vector store."""
+    
+    global vector_store
+    
+    # Ensure vector store is initialized
+    if vector_store is None:
+        return None
+    
+    # Create the retriever
+    retriever = vector_store.as_retriever(
+        search_type="similarity", 
+        search_kwargs={"k": 5}
+    )
+    
+    # Create the RAG prompt
+    prompt = ChatPromptTemplate.from_template(RAG_SYSTEM_PROMPT)
+    
+    # Setup the RAG chain
+    rag_chain = (
+        {"context": retriever, "question": RunnablePassthrough()}
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+    
+    return rag_chain
+
+
+# Chainlit setup function
+@cl.on_chat_start
+async def start():
+    """Initialize the chat session."""
+    
+    # Send an initial message
+    await cl.Message(
+        content="Welcome to PDF-RAG! Please upload a PDF file to get started."
+    ).send()
+    
+    # Set up file handling for PDF uploads
+    files = None
+    while files is None:
+        files = await cl.AskFileMessage(
+            content="Please upload a PDF file to continue",
+            accept=["application/pdf"],
+            max_size_mb=20,
+            timeout=180,
+        ).send()
+    
+    file = files[0]
+    
+    # Send a processing message
+    processing_msg = cl.Message(content=f"Processing `{file.name}`...")
+    await processing_msg.send()
+    
+    # Process the PDF
+    try:
+        global vector_store
+        
+        # Get PDF chunks
+        pdf_chunks = process_pdf(file)
+        
+        # Create vector store with document embeddings
+        vector_store = Chroma.from_documents(
+            documents=pdf_chunks,
+            embedding=EMBEDDING_MODEL,
+            persist_directory=None  # In-memory for now; use a path for persistence
+        )
+        
+        # Update the processing message
+        await processing_msg.update(content=f"✅ `{file.name}` processed and ready for questions!")
+        
+        # Store the file name in the user session
+        cl.user_session.set("file_name", file.name)
+        
+    except Exception as e:
+        await processing_msg.update(content=f"❌ Error processing `{file.name}`: {str(e)}")
+        raise
+
+
+# Handle chat messages
+@cl.on_message
+async def main(message: cl.Message):
+    """Handle user messages and generate responses."""
+    
+    # Check if a PDF has been processed
+    if vector_store is None:
+        await cl.Message(
+            content="Please upload a PDF file first before asking questions."
+        ).send()
+        return
+    
+    # Get the user's question
+    query = message.content
+    
+    # Get the RAG pipeline
+    rag_chain = setup_rag_pipeline()
+    
+    if rag_chain is None:
+        await cl.Message(
+            content="Error: RAG pipeline not initialized. Please try uploading your PDF again."
+        ).send()
+        return
+    
+    # Send a thinking message
+    thinking_msg = cl.Message(content="Thinking...")
+    await thinking_msg.send()
+    
+    try:
+        # Get the file name from user session
+        file_name = cl.user_session.get("file_name")
+        
+        # Process the query through the RAG chain
+        response = rag_chain.invoke(query)
+        
+        # Update the message with the response
+        await thinking_msg.update(content=f"Based on `{file_name}`:\n\n{response}")
+        
+    except Exception as e:
+        await thinking_msg.update(content=f"❌ Error generating response: {str(e)}")
+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
+
+# If running directly (for testing)
+if __name__ == "__main__":
+    print("This application should be run with Chainlit.")
+    print("Run: 'chainlit run app.py' in your terminal")
+
+
+# requirements.txt - Dependencies for the application
+
+langchain>=0.1.0
+langchain-groq>=0.1.0
+langchain-community>=0.1.0
+chainlit>=1.0.0
+chromadb>=0.4.22
+PyPDF2>=3.0.0
+python-dotenv>=1.0.0
+
+
+# .env - Environment variables (create this file in your project root)
+# GROQ_API_KEY=your-groq-api-key
+
+
+# README.md - Project Documentation
+
+# PDF-RAG Application
+
+This application allows you to upload PDF documents and ask questions about their content. It uses Retrieval Augmented Generation (RAG) to provide accurate answers based on the document content.
+
+## Features
+
+- PDF document upload and processing
+- Natural language querying of PDF content
+- AI-powered answers using Groq's LLM
+- User-friendly chat interface
+
+## Technical Stack
+
+- **Frontend & UI**: Chainlit
+- **Document Processing**: Langchain
+- **Vector Database**: ChromaDB
+- **Embedding Model**: Groq Embeddings
+- **LLM**: Groq (LLama3-70B)
+
+## Setup Instructions
+
+1. Clone this repository
+2. Install dependencies: `pip install -r requirements.txt`
+3. Create a `.env` file with your Groq API key: `GROQ_API_KEY=your-key-here`
+4. Run the application: `chainlit run app.py`
+5. Open your browser to the URL shown in the terminal (typically http://localhost:8000)
+
+## Usage
+
+1. Upload a PDF document when prompted
+2. Wait for the document to be processed
+3. Ask questions about the document content
+4. Receive AI-generated answers based on the document
+
+## Limitations
+
+- Large PDFs may take longer to process
+- The application works best with text-based PDFs rather than scanned documents
+- Quality of answers depends on the clarity and structure of the source PDF
